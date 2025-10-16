@@ -53,6 +53,25 @@ _PLACEHOLDER_VALUES = {
 }
 
 
+def _is_effectively_unset(value) -> bool:
+    """Return True when a config entry still carries a placeholder value."""
+
+    if value is None:
+        return True
+
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            return True
+        value_to_check = trimmed
+    else:
+        value_to_check = str(value).strip()
+        if not value_to_check:
+            return True
+
+    return value_to_check in _PLACEHOLDER_VALUES
+
+
 def _assert_config_values():
     missing = []
     required_keys = (
@@ -63,11 +82,15 @@ def _assert_config_values():
     optional_keys = (("CHRONICLER_ID", CHRONICLER_ID),)
 
     for name, value in required_keys:
-        if value in _PLACEHOLDER_VALUES:
+        if _is_effectively_unset(value):
             missing.append(name)
 
     for name, value in optional_keys:
-        if value in _PLACEHOLDER_VALUES:
+        if _is_effectively_unset(value):
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
             logger.warning(
                 "Optional configuration %s still uses a placeholder. Leave it blank if unused.",
                 name,
@@ -91,7 +114,7 @@ def _get_chronicler_chat_id():
         return None
 
     chronicler_chat_id = str(CHRONICLER_ID).strip()
-    if not chronicler_chat_id or chronicler_chat_id == "your_chronicler_chatid":
+    if _is_effectively_unset(chronicler_chat_id):
         return None
 
     return chronicler_chat_id
@@ -107,6 +130,7 @@ def load_data():
             "chores": {},
             "penalties": {},
             "members": [],
+            "member_links": {},
             "chronicler_backup": {"greeting_sent": False, "last_sent": None},
         }
         with open(DATA_FILE, "w") as file:
@@ -118,6 +142,10 @@ def load_data():
             "greeting_sent": False,
             "last_sent": None,
         }
+        save_data(data)
+
+    if "member_links" not in data:
+        data["member_links"] = {}
         save_data(data)
 
     return data
@@ -176,9 +204,40 @@ def _format_signed_currency(amount: float) -> str:
     return f"CHF {sign}{amount:.2f}"
 
 
-def _resolve_member_for_user(user, members):
+def _link_user_to_member(user, member_name, data=None) -> bool:
+    if not user or not member_name:
+        return False
+
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return False
+
+    data = data or load_data()
+    links = data.setdefault("member_links", {})
+    key = str(user_id)
+
+    if links.get(key) == member_name:
+        return False
+
+    links[key] = member_name
+    save_data(data)
+    return True
+
+
+def _resolve_member_for_user(user, data):
     if not user:
         return None
+
+    members = data.get("members", []) or []
+    links = data.get("member_links", {}) or {}
+
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        stored = links.get(str(user_id))
+        if stored:
+            match = _match_member_name(members, stored)
+            if match:
+                return match
 
     candidates = []
     if user.full_name:
@@ -193,6 +252,7 @@ def _resolve_member_for_user(user, members):
     for candidate in candidates:
         match = _match_member_name(members, candidate)
         if match:
+            _link_user_to_member(user, match, data)
             return match
     return None
 
@@ -243,6 +303,7 @@ CB_SPLIT_CANCEL = "split_cancel"
 CB_RECEIPT_TOGGLE_PREFIX = "receipt_toggle:"
 CB_RECEIPT_DONE = "receipt_done"
 CB_RECEIPT_CANCEL = "receipt_cancel"
+CB_LINK_MEMBER_PREFIX = "link_member:"
 
 # Settings
 EXPENSE_LIST_LIMIT = 20
@@ -349,6 +410,15 @@ def build_split_inline_kb(members, selected):
         ]
     )
     return InlineKeyboardMarkup(rows)
+
+
+def build_member_link_inline_kb(members):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(member, callback_data=f"{CB_LINK_MEMBER_PREFIX}{idx}")]
+            for idx, member in enumerate(members)
+        ]
+    )
 
 
 def build_receipt_items_text(items, selected):
@@ -1036,25 +1106,35 @@ def _format_expense_entry(entry, viewer_name):
     return "\n".join(lines)
 
 
-async def list_expenses(update: Update, context: CallbackContext) -> None:
-    data = load_data()
-    expenses = data.get("expenses", []) or []
-    if not expenses:
-        await update.message.reply_text(
-            "No expenses recorded yet.", reply_markup=get_main_keyboard()
-        )
-        return
+async def _prompt_member_link_selection(update: Update, context: CallbackContext, data, purpose: str) -> bool:
+    message = update.effective_message or update.message
+    if not message:
+        return False
 
     members = data.get("members", []) or []
-    viewer = _resolve_member_for_user(update.effective_user, members)
-
-    if not viewer:
-        await update.message.reply_text(
-            "I cannot match you to a household member. Please ask to be added to the member list.",
-            reply_markup=get_main_keyboard(),
+    if not members:
+        await message.reply_text(
+            "No members recorded yet.", reply_markup=get_main_keyboard()
         )
+        return False
+
+    context.user_data["member_link_prompt"] = {
+        "purpose": purpose,
+        "members": members,
+    }
+
+    await message.reply_text(
+        "I cannot map you to a household member yet. Please pick your name:",
+        reply_markup=build_member_link_inline_kb(members),
+    )
+    return True
+
+
+async def _send_recent_expenses_for_member(message, viewer, data):
+    if not message:
         return
 
+    expenses = data.get("expenses", []) or []
     viewer_norm = _normalise_member_name(viewer)
 
     relevant = []
@@ -1071,17 +1151,81 @@ async def list_expenses(update: Update, context: CallbackContext) -> None:
             break
 
     if not relevant:
-        await update.message.reply_text(
+        await message.reply_text(
             "No recent expenses linked to you.", reply_markup=get_main_keyboard()
         )
         return
 
-    formatted = [
-        _format_expense_entry(entry, viewer) for entry in relevant
-    ]
+    formatted = [_format_expense_entry(entry, viewer) for entry in relevant]
     header = f"<b>Recent expenses involving {html.escape(viewer)}</b>"
     text = header + "\n\n" + "\n\n".join(formatted)
-    await update.message.reply_html(text, reply_markup=get_main_keyboard())
+    await message.reply_html(text, reply_markup=get_main_keyboard())
+
+
+async def list_expenses(update: Update, context: CallbackContext) -> None:
+    data = load_data()
+    expenses = data.get("expenses", []) or []
+    if not expenses:
+        await update.message.reply_text(
+            "No expenses recorded yet.", reply_markup=get_main_keyboard()
+        )
+        return
+
+    viewer = _resolve_member_for_user(update.effective_user, data)
+
+    if not viewer:
+        if await _prompt_member_link_selection(update, context, data, "list_expenses"):
+            return
+        await update.message.reply_text(
+            "I cannot match you to a household member. Please ask to be added to the member list.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    await _send_recent_expenses_for_member(update.message, viewer, data)
+
+
+async def link_member_cb(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    prompt = context.user_data.get("member_link_prompt") or {}
+    if not prompt:
+        await query.answer("Selection expired. Please try again.", show_alert=True)
+        return
+
+    payload = query.data[len(CB_LINK_MEMBER_PREFIX):]
+    members = prompt.get("members") or []
+
+    try:
+        choice_idx = int(payload)
+    except ValueError:
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    if not 0 <= choice_idx < len(members):
+        await query.answer("Invalid selection.", show_alert=True)
+        return
+
+    selected = members[choice_idx]
+    data = load_data()
+    current_members = data.get("members", []) or []
+    canonical = _match_member_name(current_members, selected)
+    if not canonical:
+        context.user_data.pop("member_link_prompt", None)
+        await query.edit_message_text(
+            "That member is no longer available. Please try again."
+        )
+        return
+
+    _link_user_to_member(query.from_user, canonical, data)
+
+    context.user_data.pop("member_link_prompt", None)
+    await query.edit_message_text(f"Linked you to {canonical}.")
+
+    purpose = prompt.get("purpose")
+    if purpose == "list_expenses":
+        await _send_recent_expenses_for_member(query.message, canonical, data)
 
 
 # Calculate + show standings
@@ -1186,7 +1330,7 @@ async def start_edit_entries(update: Update, context: CallbackContext) -> int:
         )
         return ConversationHandler.END
 
-    detected = _resolve_member_for_user(update.effective_user, members)
+    detected = _resolve_member_for_user(update.effective_user, data)
     if detected:
         return await _initiate_edit_for_member(
             update.message, context, detected, data
@@ -1212,9 +1356,10 @@ async def edit_entries_pick_member(update: Update, context: CallbackContext) -> 
         )
         return ConversationHandler.END
 
+    data = load_data()
     members = context.user_data.get("edit_member_selection")
     if not members:
-        members = load_data().get("members", []) or []
+        members = data.get("members", []) or []
 
     match = _match_member_name(members, choice)
     if not match:
@@ -1223,8 +1368,9 @@ async def edit_entries_pick_member(update: Update, context: CallbackContext) -> 
         )
         return EDIT_PICK_MEMBER
 
+    _link_user_to_member(update.effective_user, match, data)
     context.user_data.pop("edit_member_selection", None)
-    return await _initiate_edit_for_member(update.message, context, match)
+    return await _initiate_edit_for_member(update.message, context, match, data)
 
 
 async def edit_entries_menu(update: Update, context: CallbackContext) -> int:
@@ -1746,6 +1892,8 @@ def main():
         conversation_timeout=300,
     )
     app.add_handler(chore_conv)
+
+    app.add_handler(CallbackQueryHandler(link_member_cb, pattern=f"^{CB_LINK_MEMBER_PREFIX}"))
 
     setup_weekly_job(app)
     setup_chronicler_backup_job(app)
